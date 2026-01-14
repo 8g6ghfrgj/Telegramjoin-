@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+
+# Database
+*.db
+*.sqlite3
+*.db-journal
+
+# Logs
+logs/
+*.log
+
+# Backups
+backups/
+*.bak
+*.backup
+
+# Config
+config.ini
+
+# System
+.DS_Store
+Thumbs.db
