@@ -347,11 +347,11 @@ class TelegramGroupJoinerBot:
         self.config = ConfigManager.load_config()
         
         # الحصول على التوكن ومعرف المسؤول
-        self.bot_token = self.config['BOT'].get('token')
+        self.bot_token = self.config['BOT'].get('8494843591:AAGQkd-XLIjFSNP7CPlMsjKsyxHj0xI6LBk')
         self.admin_id = int(self.config['BOT'].get('admin_id', '8294336757'))
         
         # التحقق من التوكن
-        if not self.bot_token or self.bot_token == 'YOUR_BOT_TOKEN_HERE':
+        if not self.bot_token or self.bot_token == '8494843591:AAGQkd-XLIjFSNP7CPlMsjKsyxHj0xI6LBk':
             raise ValueError("❌ يرجى إضافة توكن البوت في config.ini أو متغير BOT_TOKEN البيئي")
         
         # إعدادات الأداء
@@ -1778,8 +1778,8 @@ async def main():
             os.makedirs(folder, exist_ok=True)
         
         # التحقق من متغيرات البيئة
-        bot_token = os.environ.get('BOT_TOKEN')
-        admin_id = os.environ.get('ADMIN_ID')
+        bot_token = os.environ.get('8494843591:AAGQkd-XLIjFSNP7CPlMsjKsyxHj0xI6LBk')
+        admin_id = os.environ.get('8294336757')
         
         if not bot_token:
             logger.warning("⚠️  لم يتم تعيين BOT_TOKEN في متغيرات البيئة")
@@ -1789,7 +1789,7 @@ async def main():
         bot = TelegramGroupJoinerBot()
         
         # التحقق من التوكن
-        if not bot.bot_token or bot.bot_token == 'YOUR_BOT_TOKEN_HERE':
+        if not bot.bot_token or bot.bot_token == '8494843591:AAGQkd-XLIjFSNP7CPlMsjKsyxHj0xI6LBk':
             logger.error("❌ يرجى إضافة توكن البوت في config.ini أو متغير BOT_TOKEN البيئي")
             print("=" * 50)
             print("❌ خطأ: يرجى إضافة توكن البوت")
