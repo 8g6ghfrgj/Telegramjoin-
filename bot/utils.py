@@ -3,18 +3,19 @@ import re
 from urllib.parse import urlparse
 
 # Telegram link extractor:
-# - username links:  https://t.me/SomeChannel
-# - invite links:    https://t.me/+HASH
-# - old invite:      https://t.me/joinchat/HASH
-# - folder invite:   https://t.me/addlist/SLUG
+# Supports:
+# - username links:   https://t.me/SomeChannel   OR  t.me/SomeChannel
+# - invite links:     https://t.me/+HASH         OR  t.me/+HASH
+# - old invite links: https://t.me/joinchat/HASH OR  t.me/joinchat/HASH
+# - folder invite:    https://t.me/addlist/SLUG  OR  t.me/addlist/SLUG
 TG_LINK_RE = re.compile(
-    r"(https?://t\.me/(?:addlist/|joinchat/|\+)?[A-Za-z0-9_\-+]+)",
+    r"((?:https?://)?t\.me/(?:addlist/|joinchat/|\+)?[A-Za-z0-9_\-+]+)",
     re.IGNORECASE
 )
 
 
 def extract_telegram_links(text: str) -> list[str]:
-    """Extract all telegram links from any text (dedup is done elsewhere)."""
+    """Extract all Telegram links from any text."""
     if not text:
         return []
 
@@ -22,16 +23,28 @@ def extract_telegram_links(text: str) -> list[str]:
 
     cleaned: list[str] = []
     for l in links:
-        # remove trailing punctuation
-        l = l.strip().rstrip(").,;!؟…]}>")
+        l = l.strip()
+
+        # remove trailing punctuation / brackets (common in formatted messages)
+        l = l.rstrip(").,;!؟…]}>\"'")
+
         cleaned.append(l)
 
     return cleaned
 
 
 def normalize_tme_link(link: str) -> str:
-    """Normalize t.me links (remove query params, normalize host/path)."""
+    """
+    Normalize Telegram links:
+    - force https scheme
+    - remove query parameters
+    - normalize to 'https://t.me/<path>'
+    """
     link = (link or "").strip()
+
+    # Add scheme if missing
+    if link.startswith("t.me/"):
+        link = "https://" + link
 
     try:
         u = urlparse(link)
