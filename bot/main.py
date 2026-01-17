@@ -5,12 +5,7 @@ import re
 from typing import Dict
 
 from pyrogram import Client, filters
-from pyrogram.types import (
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-    Message,
-)
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
 
 from bot.config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID
 from bot import db
@@ -30,23 +25,19 @@ STATE_WAIT_CHANNELS = "wait_channels"
 # ---------------- Join control ----------------
 JOIN_RUNNING = False
 STOP_EVENT = asyncio.Event()
-JOIN_LOCK = asyncio.Lock()  # prevent concurrent start_join orchestration
+JOIN_LOCK = asyncio.Lock()  # prevent multi-start race
 
 
-def main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("➕ إضافة جلسة", callback_data="add_session"),
-                InlineKeyboardButton("👁️ عرض الجلسات", callback_data="view_sessions"),
-            ],
-            [InlineKeyboardButton("🗑️ حذف جلسة", callback_data="delete_session")],
-            [InlineKeyboardButton("📥 طلب قنوات الروابط", callback_data="request_channels")],
-            [InlineKeyboardButton("🚀 توزيع + انضمام", callback_data="start_join")],
-            [InlineKeyboardButton("📊 الإحصائيات", callback_data="stats")],
-            [InlineKeyboardButton("🛑 إيقاف الانضمام", callback_data="stop_join")],
-        ]
-    )
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ إضافة جلسة", callback_data="add_session"),
+         InlineKeyboardButton("👁️ عرض الجلسات", callback_data="view_sessions")],
+        [InlineKeyboardButton("🗑️ حذف جلسة", callback_data="delete_session")],
+        [InlineKeyboardButton("📥 طلب قنوات الروابط", callback_data="request_channels")],
+        [InlineKeyboardButton("🚀 توزيع + انضمام", callback_data="start_join")],
+        [InlineKeyboardButton("📊 الإحصائيات", callback_data="stats")],
+        [InlineKeyboardButton("🛑 إيقاف الانضمام", callback_data="stop_join")]
+    ])
 
 
 bot = Client(
@@ -55,6 +46,53 @@ bot = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
 )
+
+
+def _fmt_stats_text(st: dict) -> str:
+    sessions = st.get("sessions", 0)
+
+    total_links = st.get("total_links", 0)
+    dead_links = st.get("dead_links", 0)
+
+    reserve_links = st.get("reserve_links", 0)
+    reserve_target = st.get("reserve_target", 0)
+
+    assigned = st.get("assigned", 0)
+    unassigned = st.get("unassigned", 0)
+
+    pending = st.get("pending", 0)
+    success = st.get("success", 0)
+    failed = st.get("failed", 0)
+
+    processed = success + failed
+    success_rate = (success / processed * 100.0) if processed else 0.0
+
+    txt = (
+        "📊 **الإحصائيات**\n\n"
+        f"👥 Sessions (Active): {sessions}\n\n"
+        f"🔗 Links Total: {total_links}\n"
+        f"☠️ Dead Links: {dead_links}\n\n"
+        f"📦 Reserve Pool (Active Unassigned): {reserve_links}\n"
+        f"🎯 Reserve Target: {reserve_target}\n\n"
+        f"📌 Assigned: {assigned}\n"
+        f"🆓 Unassigned (Any): {unassigned}\n\n"
+        f"⏳ Pending joins: {pending}\n"
+        f"✅ Success: {success}\n"
+        f"❌ Failed: {failed}\n"
+        f"📈 Success rate: {success_rate:.2f}%\n"
+    )
+
+    # Per-session breakdown
+    per_session = st.get("per_session", [])
+    if per_session:
+        txt += "\n👤 **Per Session:**\n"
+        for r in per_session:
+            txt += (
+                f"- Session {r['session_id']}: "
+                f"⏳ {r['pending']} | ✅ {r['success']} | ❌ {r['failed']}\n"
+            )
+
+    return txt
 
 
 @bot.on_message(filters.command("start") & filters.private)
@@ -66,8 +104,11 @@ async def start_handler(client: Client, message: Message):
     await message.reply_text(
         "مرحباً بك.\n\n"
         "هذا بوت إدارة جلسات Telethon لاستخراج روابط القنوات وتوزيعها (1000 لكل حساب) ثم الانضمام لها.\n\n"
-        "ملاحظة: الإحصائيات والتقارير تُحفظ في قاعدة البيانات.",
-        reply_markup=main_keyboard(),
+        "✅ يدعم:\n"
+        "- Reserve 500 رابط للاستبدال الفوري\n"
+        "- وسم الروابط الميتة Dead وعدم تكرارها\n"
+        "- التعامل الصحيح مع FloodWait\n",
+        reply_markup=main_keyboard()
     )
 
 
@@ -81,19 +122,19 @@ async def callbacks(client: Client, cq: CallbackQuery):
 
     data = cq.data
 
-    # ---------------- Add session ----------------
+    # ---------------- add_session ----------------
     if data == "add_session":
         USER_STATE[cq.from_user.id] = STATE_WAIT_SESSION
         await cq.message.edit_text(
             "➕ **إضافة جلسة Telethon**\n\n"
             "أرسل الآن StringSession (نص طويل)\n"
             "ملاحظة: سيتم قبول الرسالة إذا طولها أكبر من 100 حرف.",
-            reply_markup=main_keyboard(),
+            reply_markup=main_keyboard()
         )
         await cq.answer()
         return
 
-    # ---------------- View sessions ----------------
+    # ---------------- view_sessions ----------------
     if data == "view_sessions":
         sessions = db.list_sessions()
         if not sessions:
@@ -107,7 +148,7 @@ async def callbacks(client: Client, cq: CallbackQuery):
         await cq.answer()
         return
 
-    # ---------------- Delete session ----------------
+    # ---------------- delete_session ----------------
     if data == "delete_session":
         sessions = db.list_sessions()
         if not sessions:
@@ -124,14 +165,17 @@ async def callbacks(client: Client, cq: CallbackQuery):
 
     if data.startswith("del_"):
         sid = int(data.split("_")[-1])
-        # NOTE: this is hard delete in current db.py
-        # We will later upgrade to soft-delete to avoid losing assignments.
+        # This is soft delete (as implemented in db.py)
         db.delete_session(sid)
-        await cq.message.edit_text(f"✅ تم حذف الجلسة {sid}", reply_markup=main_keyboard())
+        await cq.message.edit_text(
+            f"✅ تم حذف الجلسة {sid} (Soft Delete)\n"
+            "📌 ملاحظة: الروابط المعلقة تم إرجاعها إلى Unassigned تلقائياً.",
+            reply_markup=main_keyboard()
+        )
         await cq.answer()
         return
 
-    # ---------------- Request channels ----------------
+    # ---------------- request_channels ----------------
     if data == "request_channels":
         USER_STATE[cq.from_user.id] = STATE_WAIT_CHANNELS
         await cq.message.edit_text(
@@ -141,18 +185,17 @@ async def callbacks(client: Client, cq: CallbackQuery):
             "مثال:\n"
             "https://t.me/channel1\n"
             "https://t.me/channel2",
-            reply_markup=main_keyboard(),
+            reply_markup=main_keyboard()
         )
         await cq.answer()
         return
 
-    # ---------------- Start join orchestration ----------------
+    # ---------------- start_join ----------------
     if data == "start_join":
         if JOIN_RUNNING:
             await cq.answer("عملية الانضمام تعمل بالفعل!", show_alert=True)
             return
 
-        # prevent multi-click race
         async with JOIN_LOCK:
             if JOIN_RUNNING:
                 await cq.answer("عملية الانضمام تعمل بالفعل!", show_alert=True)
@@ -163,56 +206,35 @@ async def callbacks(client: Client, cq: CallbackQuery):
 
             await cq.message.edit_text(
                 "🚀 بدء العملية:\n"
-                "1) توزيع الروابط 1000 لكل Session (بدون تكرار)\n"
+                "1) توزيع الروابط 1000 لكل Session (مع الحفاظ على Reserve)\n"
                 "2) تشغيل الانضمام لكل الحسابات بالتوازي\n\n"
                 "سيتم إرسال تقارير هنا.",
-                reply_markup=main_keyboard(),
+                reply_markup=main_keyboard()
             )
             await cq.answer()
 
             asyncio.create_task(orchestrate_join(cq.message))
         return
 
-    # ---------------- Stats ----------------
+    # ---------------- stats ----------------
     if data == "stats":
         st = db.get_stats()
         needed = estimate_needed_sessions()
 
-        # Use .get() to prevent crashing if db.get_stats not yet updated
-        sessions = st.get("sessions", 0)
-        total_links = st.get("total_links", 0)
-        assigned = st.get("assigned", 0)
-        unassigned = st.get("unassigned", 0)
-        pending = st.get("pending", 0)
-        success = st.get("success", 0)
-        failed = st.get("failed", 0)
-
-        dead_links = st.get("dead_links", 0)
-        reserve_links = st.get("reserve_links", 0)
-
-        processed = success + failed
-        success_rate = (success / processed * 100.0) if processed else 0.0
-
-        txt = (
-            "📊 **الإحصائيات**\n\n"
-            f"👥 Sessions: {sessions}\n\n"
-            f"🔗 Links Total: {total_links}\n"
-            f"☠️ Dead Links: {dead_links}\n"
-            f"📦 Reserve (Unassigned Active): {reserve_links}\n\n"
-            f"📌 Assigned: {assigned}\n"
-            f"🆓 Unassigned: {unassigned}\n\n"
-            f"⏳ Pending joins: {pending}\n"
-            f"✅ Success: {success}\n"
-            f"❌ Failed: {failed}\n"
-            f"📈 Success rate: {success_rate:.2f}%\n\n"
-            f"🧮 تحتاج تقريباً إلى Sessions إضافية لمعالجة غير الموزع: {needed.get('needed_sessions')}\n"
+        txt = _fmt_stats_text(st)
+        txt += (
+            "\n\n🧮 **تقدير Sessions إضافية مطلوبة**\n"
+            f"- Unassigned Active: {needed.get('unassigned_active')}\n"
+            f"- Reserve Target: {needed.get('reserve_target')}\n"
+            f"- Distributable: {needed.get('distributable')}\n"
+            f"- Needed Sessions: {needed.get('needed_sessions')}\n"
         )
 
         await cq.message.edit_text(txt, reply_markup=main_keyboard())
         await cq.answer()
         return
 
-    # ---------------- Stop join ----------------
+    # ---------------- stop_join ----------------
     if data == "stop_join":
         if not JOIN_RUNNING:
             await cq.answer("لا توجد عملية انضمام شغالة.", show_alert=True)
@@ -222,7 +244,7 @@ async def callbacks(client: Client, cq: CallbackQuery):
         await cq.answer()
         return
 
-    # ---------------- Back ----------------
+    # ---------------- back ----------------
     if data == "back":
         await cq.message.edit_text("اختر:", reply_markup=main_keyboard())
         await cq.answer()
@@ -236,7 +258,7 @@ async def private_text_handler(client: Client, message: Message):
 
     state = USER_STATE.get(message.from_user.id)
 
-    # ---------------- Add session state ----------------
+    # ---------------- add session flow ----------------
     if state == STATE_WAIT_SESSION:
         text = (message.text or "").strip()
         if len(text) < 100:
@@ -252,10 +274,9 @@ async def private_text_handler(client: Client, message: Message):
         USER_STATE.pop(message.from_user.id, None)
         return
 
-    # ---------------- Wait channels state ----------------
+    # ---------------- channels extraction flow ----------------
     if state == STATE_WAIT_CHANNELS:
         text = message.text or ""
-
         channel_links = re.findall(r"(https?://t\.me/\S+)", text)
         channel_links = [normalize_tme_link(x) for x in channel_links]
 
@@ -285,16 +306,15 @@ async def private_text_handler(client: Client, message: Message):
         USER_STATE.pop(message.from_user.id, None)
         await message.reply_text(
             f"🏁 انتهى الاستخراج. إجمالي الروابط الجديدة: {total_added}",
-            reply_markup=main_keyboard(),
+            reply_markup=main_keyboard()
         )
         return
 
 
 async def orchestrate_join(message: Message):
     """
-    Orchestrates:
-    1) distribute links to sessions (1000 each)
-    2) run concurrent joiners (Telethon) for each session
+    1) distribute with reserve protection
+    2) run join concurrently for all active sessions
     """
     global JOIN_RUNNING
 
@@ -313,9 +333,12 @@ async def orchestrate_join(message: Message):
         txt = (
             "📌 **تقرير التوزيع**\n"
             f"- Sessions: {report['sessions']}\n"
-            f"- Unassigned before: {report['unassigned_before']}\n"
-            f"- Assigned total: {report['assigned_total']}\n"
-            f"- Unassigned after: {report['unassigned_after']}\n\n"
+            f"- Unassigned Active Before: {report.get('unassigned_active_before')}\n"
+            f"- Reserve Target: {report.get('reserve_target')}\n"
+            f"- Distributable Before: {report.get('distributable_before')}\n"
+            f"- Assigned Total: {report['assigned_total']}\n"
+            f"- Unassigned Active After: {report.get('unassigned_active_after')}\n"
+            f"- Reserve After: {report.get('reserve_after')}\n\n"
         )
         for row in report["per_session"]:
             txt += f"Session {row['session_id']}: assigned {row['assigned']}\n"
@@ -332,7 +355,7 @@ async def orchestrate_join(message: Message):
                     sid,
                     session_string,
                     limit=1000,
-                    stop_flag=STOP_EVENT,
+                    stop_flag=STOP_EVENT
                 )
             )
 
