@@ -25,7 +25,7 @@ STATE_WAIT_CHANNELS = "wait_channels"
 # ---------------- Join control ----------------
 JOIN_RUNNING = False
 STOP_EVENT = asyncio.Event()
-JOIN_LOCK = asyncio.Lock()  # prevent multi-start race
+JOIN_LOCK = asyncio.Lock()
 
 
 def main_keyboard():
@@ -61,6 +61,7 @@ def _fmt_stats_text(st: dict) -> str:
     unassigned = st.get("unassigned", 0)
 
     pending = st.get("pending", 0)
+    requested = st.get("requested", 0)
     success = st.get("success", 0)
     failed = st.get("failed", 0)
 
@@ -77,19 +78,22 @@ def _fmt_stats_text(st: dict) -> str:
         f"📌 Assigned: {assigned}\n"
         f"🆓 Unassigned (Any): {unassigned}\n\n"
         f"⏳ Pending joins: {pending}\n"
+        f"🕒 Requested (Waiting approval): {requested}\n"
         f"✅ Success: {success}\n"
         f"❌ Failed: {failed}\n"
         f"📈 Success rate: {success_rate:.2f}%\n"
     )
 
-    # Per-session breakdown
     per_session = st.get("per_session", [])
     if per_session:
         txt += "\n👤 **Per Session:**\n"
         for r in per_session:
             txt += (
                 f"- Session {r['session_id']}: "
-                f"⏳ {r['pending']} | ✅ {r['success']} | ❌ {r['failed']}\n"
+                f"⏳ {r.get('pending', 0)} | "
+                f"🕒 {r.get('requested', 0)} | "
+                f"✅ {r.get('success', 0)} | "
+                f"❌ {r.get('failed', 0)}\n"
             )
 
     return txt
@@ -105,9 +109,10 @@ async def start_handler(client: Client, message: Message):
         "مرحباً بك.\n\n"
         "هذا بوت إدارة جلسات Telethon لاستخراج روابط القنوات وتوزيعها (1000 لكل حساب) ثم الانضمام لها.\n\n"
         "✅ يدعم:\n"
-        "- Reserve 500 رابط للاستبدال الفوري\n"
+        "- Reserve روابط للاستبدال الفوري\n"
         "- وسم الروابط الميتة Dead وعدم تكرارها\n"
-        "- التعامل الصحيح مع FloodWait\n",
+        "- FloodWait Sleep وإكمال تلقائي\n"
+        "- Join Request حالة requested بدل فشل\n",
         reply_markup=main_keyboard()
     )
 
@@ -165,11 +170,10 @@ async def callbacks(client: Client, cq: CallbackQuery):
 
     if data.startswith("del_"):
         sid = int(data.split("_")[-1])
-        # This is soft delete (as implemented in db.py)
-        db.delete_session(sid)
+        db.delete_session(sid)  # soft delete
         await cq.message.edit_text(
             f"✅ تم حذف الجلسة {sid} (Soft Delete)\n"
-            "📌 ملاحظة: الروابط المعلقة تم إرجاعها إلى Unassigned تلقائياً.",
+            "📌 الروابط المعلقة تم إرجاعها إلى Unassigned تلقائياً.",
             reply_markup=main_keyboard()
         )
         await cq.answer()
@@ -313,8 +317,8 @@ async def private_text_handler(client: Client, message: Message):
 
 async def orchestrate_join(message: Message):
     """
-    1) distribute with reserve protection
-    2) run join concurrently for all active sessions
+    1) distribute (respect reserve)
+    2) join concurrently for all active sessions
     """
     global JOIN_RUNNING
 
@@ -350,24 +354,22 @@ async def orchestrate_join(message: Message):
 
         tasks = []
         for sid, session_string, _, _ in sessions:
-            tasks.append(
-                run_session_joiner(
-                    sid,
-                    session_string,
-                    limit=1000,
-                    stop_flag=STOP_EVENT
-                )
-            )
+            tasks.append(run_session_joiner(sid, session_string, limit=1000, stop_flag=STOP_EVENT))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # report
         final_txt = "🏁 **نتيجة الانضمام**\n\n"
         for res in results:
             if isinstance(res, Exception):
                 final_txt += f"❌ خطأ: {res}\n"
             else:
-                final_txt += f"- Session {res['session_id']}: ✅ {res['success']} | ❌ {res['failed']}\n"
+                # requested is supported now
+                final_txt += (
+                    f"- Session {res.get('session_id')}: "
+                    f"✅ {res.get('success', 0)} | "
+                    f"🕒 {res.get('requested', 0)} | "
+                    f"❌ {res.get('failed', 0)}\n"
+                )
 
         await message.reply_text(final_txt)
 
