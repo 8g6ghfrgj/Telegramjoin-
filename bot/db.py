@@ -33,9 +33,11 @@ def _column_exists(conn: sqlite3.Connection, table: str, col: str) -> bool:
 def _ensure_schema_migrations(conn: sqlite3.Connection) -> None:
     """
     Apply schema migrations safely for existing DB.
-    - Adds links.status / dead_reason / last_checked_at if missing
+    Adds:
+    - links.status
+    - links.dead_reason
+    - links.last_checked_at
     """
-    # links.status
     if not _column_exists(conn, "links", "status"):
         conn.execute("ALTER TABLE links ADD COLUMN status TEXT DEFAULT 'active';")
 
@@ -96,7 +98,7 @@ def init_db():
         );
         """)
 
-        # Apply migrations (if upgrading existing DB)
+        # Apply migrations for old DBs
         _ensure_schema_migrations(conn)
 
         conn.commit()
@@ -130,16 +132,16 @@ def list_sessions():
 
 def soft_delete_session(session_id: int) -> None:
     """
-    Soft delete session to avoid losing assignments.
-    Also returns its *pending* links back to unassigned pool by deleting pending assignments.
+    Soft delete session to avoid losing assigned links permanently.
 
-    This ensures: "البوت لا يفقد الروابط التي يقوم بتوزيعها لكل حساب أبداً".
+    Also requeues its pending links:
+      - delete assignments where join_status='pending'
+    So these links become unassigned again and can be distributed to other sessions.
     """
     with get_conn() as conn:
-        # mark session deleted
         conn.execute("UPDATE sessions SET status='deleted' WHERE id=?", (session_id,))
 
-        # requeue pending links (unassign them)
+        # requeue pending links for re-distribution
         conn.execute("""
             DELETE FROM assignments
             WHERE session_id=?
@@ -149,10 +151,9 @@ def soft_delete_session(session_id: int) -> None:
         conn.commit()
 
 
-# Backward compatibility with existing code calling delete_session()
 def delete_session(session_id: int) -> None:
     """
-    IMPORTANT: This is now soft-delete, not hard delete.
+    Backward compatible API: delete_session now means SOFT delete.
     """
     soft_delete_session(session_id)
 
@@ -172,8 +173,8 @@ def get_session_by_id(session_id: int):
 # ---------------- links ----------------
 def add_links(links: List[str], source_channel: str) -> int:
     """
-    Insert links as active (default).
-    Dead links are NOT reactivated automatically.
+    Insert links as active by default.
+    Dead links are NOT reactivated.
     """
     added = 0
     with get_conn() as conn:
@@ -184,12 +185,11 @@ def add_links(links: List[str], source_channel: str) -> int:
             if not link:
                 continue
 
-            # Insert ignore duplicates
+            # insert as active
             cur.execute(
                 "INSERT OR IGNORE INTO links(link, source_channel, status) VALUES(?,?, 'active')",
                 (link, source_channel),
             )
-
             if cur.rowcount > 0:
                 added += 1
 
@@ -209,14 +209,6 @@ def mark_link_dead(link_id: int, reason: str = "") -> None:
         conn.commit()
 
 
-def get_link_by_id(link_id: int) -> Optional[Tuple[int, str]]:
-    with get_conn() as conn:
-        row = conn.execute("SELECT id, link FROM links WHERE id=?", (link_id,)).fetchone()
-        if not row:
-            return None
-        return (row["id"], row["link"])
-
-
 def count_links_total() -> int:
     with get_conn() as conn:
         return conn.execute("SELECT COUNT(*) FROM links").fetchone()[0]
@@ -229,7 +221,8 @@ def count_dead_links() -> int:
 
 def count_links_unassigned_active() -> int:
     """
-    Counts active links not yet assigned to any session.
+    Active links that are NOT assigned to any session.
+    (This is the reserve pool base.)
     """
     with get_conn() as conn:
         return conn.execute("""
@@ -243,8 +236,7 @@ def count_links_unassigned_active() -> int:
 
 def count_links_unassigned_any() -> int:
     """
-    Legacy equivalent: counts all unassigned links regardless of status.
-    (Usually you should use count_links_unassigned_active)
+    Counts ALL unassigned links including dead (informational only).
     """
     with get_conn() as conn:
         return conn.execute("""
@@ -255,21 +247,12 @@ def count_links_unassigned_any() -> int:
         """).fetchone()[0]
 
 
-def reserve_available_count() -> int:
-    """
-    Reserve pool is unassigned active links.
-    """
-    return count_links_unassigned_active()
-
-
 def pop_reserve_link() -> Optional[Tuple[int, str]]:
     """
-    Get ONE active unassigned link from reserve pool to replace a dead link.
-    This DOES NOT assign it automatically (assignment handled separately).
+    Get ONE active unassigned link from the reserve pool.
     """
     with get_conn() as conn:
-        cur = conn.cursor()
-        row = cur.execute("""
+        row = conn.execute("""
             SELECT l.id, l.link
             FROM links l
             LEFT JOIN assignments a ON a.link_id = l.id
@@ -288,13 +271,12 @@ def pop_reserve_link() -> Optional[Tuple[int, str]]:
 # ---------------- assignments ----------------
 def assign_unassigned_links(session_id: int, limit: int) -> int:
     """
-    Assign up to `limit` unassigned ACTIVE links to this session.
+    Assign up to `limit` unassigned ACTIVE links to a session.
     Returns assigned count.
     """
     with get_conn() as conn:
         cur = conn.cursor()
 
-        # fetch unassigned active link ids
         cur.execute("""
             SELECT l.id
             FROM links l
@@ -305,6 +287,7 @@ def assign_unassigned_links(session_id: int, limit: int) -> int:
             LIMIT ?
         """, (limit,))
         rows = cur.fetchall()
+
         if not rows:
             return 0
 
@@ -324,7 +307,7 @@ def assign_unassigned_links(session_id: int, limit: int) -> int:
 
 def get_pending_links_for_session(session_id: int, limit: int = 1000):
     """
-    Only returns ACTIVE links pending.
+    Return active links where assignment status is pending.
     """
     with get_conn() as conn:
         cur = conn.cursor()
@@ -364,9 +347,25 @@ def mark_join_failed(session_id: int, link_id: int, error: str):
         conn.commit()
 
 
+def mark_join_requested(session_id: int, link_id: int, note: str = ""):
+    """
+    For groups/channels with join request approval.
+    This is NOT failed and NOT dead.
+    """
+    with get_conn() as conn:
+        conn.execute("""
+            UPDATE assignments
+            SET join_status='requested',
+                join_attempts=join_attempts+1,
+                last_error=?
+            WHERE session_id=? AND link_id=?
+        """, ((note or "")[:1000], session_id, link_id))
+        conn.commit()
+
+
 def bump_attempt(session_id: int, link_id: int, error: str = ""):
     """
-    Useful for FloodWait: increase attempt count without failing permanently.
+    Useful for FloodWait: increase attempts WITHOUT changing join_status.
     """
     with get_conn() as conn:
         conn.execute("""
@@ -387,17 +386,19 @@ def log_join(session_id: int, link: str, status: str, error_message: str = ""):
         conn.commit()
 
 
-def replace_dead_assignment(session_id: int, dead_link_id: int, dead_reason: str = "") -> Optional[Tuple[int, str]]:
+def replace_dead_assignment(
+    session_id: int,
+    dead_link_id: int,
+    dead_reason: str = ""
+) -> Optional[Tuple[int, str]]:
     """
-    Implements "استبدال الرابط الميت فوراً برابط جديد من المخزون الاحتياطي".
+    Implements:
+    - mark dead link as dead
+    - delete its assignment
+    - pull new active unassigned link from reserve
+    - assign new link to same session
 
-    Steps:
-    1) mark the dead link as dead
-    2) delete assignment for dead link (to free up this session slot)
-    3) pop new reserve link
-    4) assign it to same session
-
-    Returns: (new_link_id, new_link) or None if no reserve link available.
+    Returns (new_link_id, new_link) or None if reserve empty.
     """
     with get_conn() as conn:
         cur = conn.cursor()
@@ -411,13 +412,13 @@ def replace_dead_assignment(session_id: int, dead_link_id: int, dead_reason: str
             WHERE id=?
         """, ((dead_reason or "")[:1000], dead_link_id))
 
-        # 2) remove old assignment
+        # 2) remove assignment
         cur.execute("""
             DELETE FROM assignments
             WHERE session_id=? AND link_id=?
         """, (session_id, dead_link_id))
 
-        # 3) select a reserve active unassigned link
+        # 3) pick reserve link
         row = cur.execute("""
             SELECT l.id, l.link
             FROM links l
@@ -435,7 +436,7 @@ def replace_dead_assignment(session_id: int, dead_link_id: int, dead_reason: str
         new_link_id = row["id"]
         new_link = row["link"]
 
-        # 4) assign new
+        # 4) assign
         cur.execute("""
             INSERT OR IGNORE INTO assignments(link_id, session_id)
             VALUES(?,?)
@@ -450,12 +451,15 @@ def get_stats() -> Dict[str, Any]:
     with get_conn() as conn:
         cur = conn.cursor()
 
-        sessions = cur.execute("SELECT COUNT(*) FROM sessions WHERE status='active'").fetchone()[0]
+        sessions = cur.execute("""
+            SELECT COUNT(*)
+            FROM sessions
+            WHERE status='active'
+        """).fetchone()[0]
 
         total_links = cur.execute("SELECT COUNT(*) FROM links").fetchone()[0]
         dead_links = cur.execute("SELECT COUNT(*) FROM links WHERE status='dead'").fetchone()[0]
 
-        # unassigned active links (reserve pool)
         reserve_links = cur.execute("""
             SELECT COUNT(*)
             FROM links l
@@ -464,7 +468,6 @@ def get_stats() -> Dict[str, Any]:
               AND (l.status IS NULL OR l.status='active')
         """).fetchone()[0]
 
-        # Unassigned including dead (informational)
         unassigned_any = cur.execute("""
             SELECT COUNT(*)
             FROM links l
@@ -472,7 +475,6 @@ def get_stats() -> Dict[str, Any]:
             WHERE a.link_id IS NULL
         """).fetchone()[0]
 
-        # Assigned count only for active sessions
         assigned_total = cur.execute("""
             SELECT COUNT(*)
             FROM assignments a
@@ -480,31 +482,18 @@ def get_stats() -> Dict[str, Any]:
             WHERE s.status='active'
         """).fetchone()[0]
 
-        pending = cur.execute("""
-            SELECT COUNT(*)
-            FROM assignments
-            WHERE join_status='pending'
-        """).fetchone()[0]
+        pending = cur.execute("SELECT COUNT(*) FROM assignments WHERE join_status='pending'").fetchone()[0]
+        requested = cur.execute("SELECT COUNT(*) FROM assignments WHERE join_status='requested'").fetchone()[0]
+        success = cur.execute("SELECT COUNT(*) FROM assignments WHERE join_status='success'").fetchone()[0]
+        failed = cur.execute("SELECT COUNT(*) FROM assignments WHERE join_status='failed'").fetchone()[0]
 
-        success = cur.execute("""
-            SELECT COUNT(*)
-            FROM assignments
-            WHERE join_status='success'
-        """).fetchone()[0]
-
-        failed = cur.execute("""
-            SELECT COUNT(*)
-            FROM assignments
-            WHERE join_status='failed'
-        """).fetchone()[0]
-
-        # Per-session stats
         per_session_rows = cur.execute("""
             SELECT
                 s.id AS session_id,
                 SUM(CASE WHEN a.join_status='pending' THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN a.join_status='requested' THEN 1 ELSE 0 END) AS requested,
                 SUM(CASE WHEN a.join_status='success' THEN 1 ELSE 0 END) AS success,
-                SUM(CASE WHEN a.join_status='failed'  THEN 1 ELSE 0 END) AS failed
+                SUM(CASE WHEN a.join_status='failed' THEN 1 ELSE 0 END) AS failed
             FROM sessions s
             LEFT JOIN assignments a ON a.session_id = s.id
             WHERE s.status='active'
@@ -515,8 +504,9 @@ def get_stats() -> Dict[str, Any]:
         per_session = []
         for r in per_session_rows:
             per_session.append({
-                "session_id": r["session_id"],
+                "session_id": int(r["session_id"]),
                 "pending": int(r["pending"] or 0),
+                "requested": int(r["requested"] or 0),
                 "success": int(r["success"] or 0),
                 "failed": int(r["failed"] or 0),
             })
@@ -536,6 +526,7 @@ def get_stats() -> Dict[str, Any]:
             "unassigned": unassigned_any,
 
             "pending": pending,
+            "requested": requested,
             "success": success,
             "failed": failed,
 
