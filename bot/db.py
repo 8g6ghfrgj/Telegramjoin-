@@ -2,22 +2,51 @@
 import os
 import sqlite3
 from contextlib import contextmanager
-from typing import Optional
+from typing import Optional, List, Tuple, Dict, Any
 
-from bot.config import DB_PATH
+from bot.config import DB_PATH, RESERVE_LINKS
 
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
 
 @contextmanager
 def get_conn():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.row_factory = sqlite3.Row
     try:
         yield conn
     finally:
         conn.close()
 
+
+# ---------------- internal helpers ----------------
+def _column_exists(conn: sqlite3.Connection, table: str, col: str) -> bool:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    for r in cur.fetchall():
+        if r["name"] == col:
+            return True
+    return False
+
+
+def _ensure_schema_migrations(conn: sqlite3.Connection) -> None:
+    """
+    Apply schema migrations safely for existing DB.
+    - Adds links.status / dead_reason / last_checked_at if missing
+    """
+    # links.status
+    if not _column_exists(conn, "links", "status"):
+        conn.execute("ALTER TABLE links ADD COLUMN status TEXT DEFAULT 'active';")
+
+    if not _column_exists(conn, "links", "dead_reason"):
+        conn.execute("ALTER TABLE links ADD COLUMN dead_reason TEXT;")
+
+    if not _column_exists(conn, "links", "last_checked_at"):
+        conn.execute("ALTER TABLE links ADD COLUMN last_checked_at TIMESTAMP;")
+
+
+# ---------------- init ----------------
 def init_db():
     with get_conn() as conn:
         cur = conn.cursor()
@@ -67,6 +96,9 @@ def init_db():
         );
         """)
 
+        # Apply migrations (if upgrading existing DB)
+        _ensure_schema_migrations(conn)
+
         conn.commit()
 
 
@@ -76,57 +108,144 @@ def add_session(session_string: str, phone: str = "") -> bool:
         try:
             conn.execute(
                 "INSERT INTO sessions(session_string, phone) VALUES(?,?)",
-                (session_string.strip(), phone.strip())
+                (session_string.strip(), phone.strip()),
             )
             conn.commit()
             return True
         except sqlite3.IntegrityError:
             return False
 
+
 def list_sessions():
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("""SELECT id, session_string, phone, created_at
-                       FROM sessions WHERE status='active'
-                       ORDER BY id ASC""")
-        return cur.fetchall()
+        cur.execute("""
+            SELECT id, session_string, phone, created_at
+            FROM sessions
+            WHERE status='active'
+            ORDER BY id ASC
+        """)
+        return [tuple(r) for r in cur.fetchall()]
 
-def delete_session(session_id: int) -> None:
+
+def soft_delete_session(session_id: int) -> None:
+    """
+    Soft delete session to avoid losing assignments.
+    Also returns its *pending* links back to unassigned pool by deleting pending assignments.
+
+    This ensures: "البوت لا يفقد الروابط التي يقوم بتوزيعها لكل حساب أبداً".
+    """
     with get_conn() as conn:
-        conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+        # mark session deleted
+        conn.execute("UPDATE sessions SET status='deleted' WHERE id=?", (session_id,))
+
+        # requeue pending links (unassign them)
+        conn.execute("""
+            DELETE FROM assignments
+            WHERE session_id=?
+              AND join_status='pending'
+        """, (session_id,))
+
         conn.commit()
+
+
+# Backward compatibility with existing code calling delete_session()
+def delete_session(session_id: int) -> None:
+    """
+    IMPORTANT: This is now soft-delete, not hard delete.
+    """
+    soft_delete_session(session_id)
+
 
 def get_session_by_id(session_id: int):
     with get_conn() as conn:
         cur = conn.cursor()
-        cur.execute("""SELECT id, session_string, phone, created_at
-                       FROM sessions WHERE id=?""", (session_id,))
-        return cur.fetchone()
+        cur.execute("""
+            SELECT id, session_string, phone, created_at
+            FROM sessions
+            WHERE id=?
+        """, (session_id,))
+        row = cur.fetchone()
+        return tuple(row) if row else None
 
 
 # ---------------- links ----------------
-def add_links(links: list[str], source_channel: str) -> int:
+def add_links(links: List[str], source_channel: str) -> int:
+    """
+    Insert links as active (default).
+    Dead links are NOT reactivated automatically.
+    """
     added = 0
     with get_conn() as conn:
         cur = conn.cursor()
+
         for link in links:
-            link = link.strip()
+            link = (link or "").strip()
             if not link:
                 continue
+
+            # Insert ignore duplicates
             cur.execute(
-                "INSERT OR IGNORE INTO links(link, source_channel) VALUES(?,?)",
-                (link, source_channel)
+                "INSERT OR IGNORE INTO links(link, source_channel, status) VALUES(?,?, 'active')",
+                (link, source_channel),
             )
+
             if cur.rowcount > 0:
                 added += 1
+
         conn.commit()
     return added
+
+
+def mark_link_dead(link_id: int, reason: str = "") -> None:
+    with get_conn() as conn:
+        conn.execute("""
+            UPDATE links
+            SET status='dead',
+                dead_reason=?,
+                last_checked_at=CURRENT_TIMESTAMP
+            WHERE id=?
+        """, ((reason or "")[:1000], link_id))
+        conn.commit()
+
+
+def get_link_by_id(link_id: int) -> Optional[Tuple[int, str]]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT id, link FROM links WHERE id=?", (link_id,)).fetchone()
+        if not row:
+            return None
+        return (row["id"], row["link"])
+
 
 def count_links_total() -> int:
     with get_conn() as conn:
         return conn.execute("SELECT COUNT(*) FROM links").fetchone()[0]
 
-def count_links_unassigned() -> int:
+
+def count_dead_links() -> int:
+    with get_conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM links WHERE status='dead'").fetchone()[0]
+
+
+def count_links_unassigned_active() -> int:
+    """
+    Counts active links not yet assigned to any session.
+    """
+    with get_conn() as conn:
+        return conn.execute("""
+            SELECT COUNT(*)
+            FROM links l
+            LEFT JOIN assignments a ON a.link_id = l.id
+            WHERE a.link_id IS NULL
+              AND (l.status IS NULL OR l.status='active')
+        """).fetchone()[0]
+
+
+def count_links_unassigned_any() -> int:
+    """
+    Legacy equivalent: counts all unassigned links regardless of status.
+    (Usually you should use count_links_unassigned_active)
+    """
     with get_conn() as conn:
         return conn.execute("""
             SELECT COUNT(*)
@@ -136,21 +255,52 @@ def count_links_unassigned() -> int:
         """).fetchone()[0]
 
 
+def reserve_available_count() -> int:
+    """
+    Reserve pool is unassigned active links.
+    """
+    return count_links_unassigned_active()
+
+
+def pop_reserve_link() -> Optional[Tuple[int, str]]:
+    """
+    Get ONE active unassigned link from reserve pool to replace a dead link.
+    This DOES NOT assign it automatically (assignment handled separately).
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        row = cur.execute("""
+            SELECT l.id, l.link
+            FROM links l
+            LEFT JOIN assignments a ON a.link_id = l.id
+            WHERE a.link_id IS NULL
+              AND (l.status IS NULL OR l.status='active')
+            ORDER BY l.id ASC
+            LIMIT 1
+        """).fetchone()
+
+        if not row:
+            return None
+
+        return (row["id"], row["link"])
+
+
 # ---------------- assignments ----------------
 def assign_unassigned_links(session_id: int, limit: int) -> int:
     """
-    Assign up to `limit` unassigned links to this session.
+    Assign up to `limit` unassigned ACTIVE links to this session.
     Returns assigned count.
     """
     with get_conn() as conn:
         cur = conn.cursor()
 
-        # fetch unassigned link ids
+        # fetch unassigned active link ids
         cur.execute("""
             SELECT l.id
             FROM links l
             LEFT JOIN assignments a ON a.link_id = l.id
             WHERE a.link_id IS NULL
+              AND (l.status IS NULL OR l.status='active')
             ORDER BY l.id ASC
             LIMIT ?
         """, (limit,))
@@ -159,7 +309,8 @@ def assign_unassigned_links(session_id: int, limit: int) -> int:
             return 0
 
         assigned = 0
-        for (link_id,) in rows:
+        for r in rows:
+            link_id = r["id"]
             cur.execute("""
                 INSERT OR IGNORE INTO assignments(link_id, session_id)
                 VALUES(?,?)
@@ -170,7 +321,11 @@ def assign_unassigned_links(session_id: int, limit: int) -> int:
         conn.commit()
         return assigned
 
+
 def get_pending_links_for_session(session_id: int, limit: int = 1000):
+    """
+    Only returns ACTIVE links pending.
+    """
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -179,10 +334,12 @@ def get_pending_links_for_session(session_id: int, limit: int = 1000):
             JOIN assignments a ON a.link_id = l.id
             WHERE a.session_id = ?
               AND a.join_status = 'pending'
+              AND (l.status IS NULL OR l.status='active')
             ORDER BY l.id ASC
             LIMIT ?
         """, (session_id, limit))
-        return cur.fetchall()
+        return [(r["id"], r["link"]) for r in cur.fetchall()]
+
 
 def mark_join_success(session_id: int, link_id: int):
     with get_conn() as conn:
@@ -194,6 +351,7 @@ def mark_join_success(session_id: int, link_id: int):
         """, (session_id, link_id))
         conn.commit()
 
+
 def mark_join_failed(session_id: int, link_id: int, error: str):
     with get_conn() as conn:
         conn.execute("""
@@ -202,42 +360,184 @@ def mark_join_failed(session_id: int, link_id: int, error: str):
                 join_attempts=join_attempts+1,
                 last_error=?
             WHERE session_id=? AND link_id=?
-        """, (error[:1000], session_id, link_id))
+        """, ((error or "")[:1000], session_id, link_id))
         conn.commit()
+
+
+def bump_attempt(session_id: int, link_id: int, error: str = ""):
+    """
+    Useful for FloodWait: increase attempt count without failing permanently.
+    """
+    with get_conn() as conn:
+        conn.execute("""
+            UPDATE assignments
+            SET join_attempts=join_attempts+1,
+                last_error=?
+            WHERE session_id=? AND link_id=?
+        """, ((error or "")[:1000], session_id, link_id))
+        conn.commit()
+
 
 def log_join(session_id: int, link: str, status: str, error_message: str = ""):
     with get_conn() as conn:
         conn.execute("""
             INSERT INTO join_log(session_id, link, status, error_message)
             VALUES(?,?,?,?)
-        """, (session_id, link, status, error_message[:1000]))
+        """, (session_id, link, status, (error_message or "")[:1000]))
         conn.commit()
 
-def get_stats():
+
+def replace_dead_assignment(session_id: int, dead_link_id: int, dead_reason: str = "") -> Optional[Tuple[int, str]]:
+    """
+    Implements "استبدال الرابط الميت فوراً برابط جديد من المخزون الاحتياطي".
+
+    Steps:
+    1) mark the dead link as dead
+    2) delete assignment for dead link (to free up this session slot)
+    3) pop new reserve link
+    4) assign it to same session
+
+    Returns: (new_link_id, new_link) or None if no reserve link available.
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        # 1) mark dead
+        cur.execute("""
+            UPDATE links
+            SET status='dead',
+                dead_reason=?,
+                last_checked_at=CURRENT_TIMESTAMP
+            WHERE id=?
+        """, ((dead_reason or "")[:1000], dead_link_id))
+
+        # 2) remove old assignment
+        cur.execute("""
+            DELETE FROM assignments
+            WHERE session_id=? AND link_id=?
+        """, (session_id, dead_link_id))
+
+        # 3) select a reserve active unassigned link
+        row = cur.execute("""
+            SELECT l.id, l.link
+            FROM links l
+            LEFT JOIN assignments a ON a.link_id = l.id
+            WHERE a.link_id IS NULL
+              AND (l.status IS NULL OR l.status='active')
+            ORDER BY l.id ASC
+            LIMIT 1
+        """).fetchone()
+
+        if not row:
+            conn.commit()
+            return None
+
+        new_link_id = row["id"]
+        new_link = row["link"]
+
+        # 4) assign new
+        cur.execute("""
+            INSERT OR IGNORE INTO assignments(link_id, session_id)
+            VALUES(?,?)
+        """, (new_link_id, session_id))
+
+        conn.commit()
+        return (new_link_id, new_link)
+
+
+# ---------------- stats ----------------
+def get_stats() -> Dict[str, Any]:
     with get_conn() as conn:
         cur = conn.cursor()
 
         sessions = cur.execute("SELECT COUNT(*) FROM sessions WHERE status='active'").fetchone()[0]
+
         total_links = cur.execute("SELECT COUNT(*) FROM links").fetchone()[0]
-        unassigned = cur.execute("""
+        dead_links = cur.execute("SELECT COUNT(*) FROM links WHERE status='dead'").fetchone()[0]
+
+        # unassigned active links (reserve pool)
+        reserve_links = cur.execute("""
+            SELECT COUNT(*)
+            FROM links l
+            LEFT JOIN assignments a ON a.link_id = l.id
+            WHERE a.link_id IS NULL
+              AND (l.status IS NULL OR l.status='active')
+        """).fetchone()[0]
+
+        # Unassigned including dead (informational)
+        unassigned_any = cur.execute("""
             SELECT COUNT(*)
             FROM links l
             LEFT JOIN assignments a ON a.link_id = l.id
             WHERE a.link_id IS NULL
         """).fetchone()[0]
 
-        assigned = total_links - unassigned
+        # Assigned count only for active sessions
+        assigned_total = cur.execute("""
+            SELECT COUNT(*)
+            FROM assignments a
+            JOIN sessions s ON s.id = a.session_id
+            WHERE s.status='active'
+        """).fetchone()[0]
 
-        pending = cur.execute("SELECT COUNT(*) FROM assignments WHERE join_status='pending'").fetchone()[0]
-        success = cur.execute("SELECT COUNT(*) FROM assignments WHERE join_status='success'").fetchone()[0]
-        failed = cur.execute("SELECT COUNT(*) FROM assignments WHERE join_status='failed'").fetchone()[0]
+        pending = cur.execute("""
+            SELECT COUNT(*)
+            FROM assignments
+            WHERE join_status='pending'
+        """).fetchone()[0]
+
+        success = cur.execute("""
+            SELECT COUNT(*)
+            FROM assignments
+            WHERE join_status='success'
+        """).fetchone()[0]
+
+        failed = cur.execute("""
+            SELECT COUNT(*)
+            FROM assignments
+            WHERE join_status='failed'
+        """).fetchone()[0]
+
+        # Per-session stats
+        per_session_rows = cur.execute("""
+            SELECT
+                s.id AS session_id,
+                SUM(CASE WHEN a.join_status='pending' THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN a.join_status='success' THEN 1 ELSE 0 END) AS success,
+                SUM(CASE WHEN a.join_status='failed'  THEN 1 ELSE 0 END) AS failed
+            FROM sessions s
+            LEFT JOIN assignments a ON a.session_id = s.id
+            WHERE s.status='active'
+            GROUP BY s.id
+            ORDER BY s.id ASC
+        """).fetchall()
+
+        per_session = []
+        for r in per_session_rows:
+            per_session.append({
+                "session_id": r["session_id"],
+                "pending": int(r["pending"] or 0),
+                "success": int(r["success"] or 0),
+                "failed": int(r["failed"] or 0),
+            })
 
         return {
             "sessions": sessions,
+
             "total_links": total_links,
-            "assigned": assigned,
-            "unassigned": unassigned,
+            "dead_links": dead_links,
+
+            # reserve pool
+            "reserve_links": reserve_links,
+            "reserve_target": RESERVE_LINKS,
+
+            # assignment stats
+            "assigned": assigned_total,
+            "unassigned": unassigned_any,
+
             "pending": pending,
             "success": success,
             "failed": failed,
+
+            "per_session": per_session,
         }
